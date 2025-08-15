@@ -454,7 +454,7 @@ def main():
             refresh_token = t.get("refresh_token", refresh_token)
             expires_at = time.time() + int(t.get("expires_in", 3600))
 
-    # Fetch playlists
+    # Fetch playlists once
     print("Fetching Spotify playlists...")
     ensure_token()
     try:
@@ -468,20 +468,6 @@ def main():
         return 0
 
     names = [f"{p['name']} ({p['tracks']['total']} tracks)" for p in playlists]
-    idx = select_from_list(names, "Select a Spotify playlist:")
-    playlist = playlists[idx]
-    playlist_name = playlist["name"]
-    playlist_id = playlist["id"]
-
-    print(f"\nFetching tracks for '{playlist_name}'...")
-    ensure_token()
-    try:
-        tracks = fetch_spotify_playlist_tracks(access_token, playlist_id)
-    except Exception as e:
-        print(f"Failed to retrieve playlist tracks: {e}", file=sys.stderr)
-        return 1
-
-    print(f"Found {len(tracks)} tracks.\n")
 
     # Navidrome creds
     base_url = cfg["navidrome"]["base_url"]
@@ -500,61 +486,83 @@ def main():
         print(f"Failed to connect to Navidrome: {e}", file=sys.stderr)
         return 1
 
-    print("Searching Navidrome for matching tracks and building playlist...")
-    matched_ids: List[str] = []
-    missing: List[Dict[str, str]] = []
+    # Loop to allow multiple playlist imports
+    while True:
+        idx = select_from_list(names, "Select a Spotify playlist:")
+        playlist = playlists[idx]
+        playlist_name = playlist["name"]
+        playlist_id = playlist["id"]
 
-    for i, t in enumerate(tracks, 1):
-        name = t.get('name', '')
-        artists = ", ".join(a.get('name', '') for a in (t.get('artists') or []))
-        album = (t.get('album') or {}).get('name')
-        duration_ms = t.get('duration_ms')
-        query = f"{name} {artists}"
-
+        print(f"\nFetching tracks for '{playlist_name}'...")
+        ensure_token()
         try:
-            candidates = sub.search_songs(query, count=8)
+            tracks = fetch_spotify_playlist_tracks(access_token, playlist_id)
         except Exception as e:
-            print(f"  [{i}/{len(tracks)}] Search failed for '{name}' - {e}")
-            missing.append({"track": name, "artist": artists, "album": album or "", "reason": "search error"})
-            continue
+            print(f"Failed to retrieve playlist tracks: {e}", file=sys.stderr)
+            return 1
 
-        best = best_song_match(candidates, name, artists, album, duration_ms)
-        if best:
-            matched_ids.append(str(best.get('id')))
-            print(f"  [{i}/{len(tracks)}] ✓ {artists} - {name}")
+        print(f"Found {len(tracks)} tracks.\n")
+
+        print("Searching Navidrome for matching tracks and building playlist...")
+        matched_ids: List[str] = []
+        missing: List[Dict[str, str]] = []
+
+        for i, t in enumerate(tracks, 1):
+            name = t.get('name', '')
+            artists = ", ".join(a.get('name', '') for a in (t.get('artists') or []))
+            album = (t.get('album') or {}).get('name')
+            duration_ms = t.get('duration_ms')
+            query = f"{name} {artists}"
+
+            try:
+                candidates = sub.search_songs(query, count=8)
+            except Exception as e:
+                print(f"  [{i}/{len(tracks)}] Search failed for '{name}' - {e}")
+                missing.append({"track": name, "artist": artists, "album": album or "", "reason": "search error"})
+                continue
+
+            best = best_song_match(candidates, name, artists, album, duration_ms)
+            if best:
+                matched_ids.append(str(best.get('id')))
+                print(f"  [{i}/{len(tracks)}] ✓ {artists} - {name}")
+            else:
+                print(f"  [{i}/{len(tracks)}] ✗ {artists} - {name} (not found)")
+                missing.append({"track": name, "artist": artists, "album": album or "", "reason": "no match"})
+
+        if matched_ids:
+            nav_playlist_name = f"{playlist_name} (from Spotify)"
+            print(f"\nCreating Navidrome playlist '{nav_playlist_name}' with {len(matched_ids)} tracks...")
+            try:
+                sub.create_playlist(nav_playlist_name, matched_ids)
+                print("Playlist created successfully.")
+            except Exception as e:
+                print(f"Failed to create playlist: {e}", file=sys.stderr)
         else:
-            print(f"  [{i}/{len(tracks)}] ✗ {artists} - {name} (not found)")
-            missing.append({"track": name, "artist": artists, "album": album or "", "reason": "no match"})
+            print("\nNo tracks matched; skipping playlist creation.")
 
-    if matched_ids:
-        nav_playlist_name = f"{playlist_name} (from Spotify)"
-        print(f"\nCreating Navidrome playlist '{nav_playlist_name}' with {len(matched_ids)} tracks...")
-        try:
-            sub.create_playlist(nav_playlist_name, matched_ids)
-            print("Playlist created successfully.")
-        except Exception as e:
-            print(f"Failed to create playlist: {e}", file=sys.stderr)
-    else:
-        print("\nNo tracks matched; skipping playlist creation.")
+        # Report missing
+        print("\n=== Missing/Unmatched Tracks ===")
+        if not missing:
+            print("All tracks were matched in Navidrome. Nice!")
+        else:
+            for m in missing:
+                print(f"- {m['artist']} - {m['track']} ({m.get('album','')}) [{m.get('reason','')}]")
+            # Save to file
+            safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", playlist_name)[:80]
+            out_path = f"missing_{safe_name}.txt"
+            try:
+                with open(out_path, 'w', encoding='utf-8') as f:
+                    f.write(f"Missing tracks for playlist: {playlist_name}\n\n")
+                    for m in missing:
+                        f.write(f"- {m['artist']} - {m['track']} ({m.get('album','')}) [{m.get('reason','')}]\n")
+                print(f"\nSaved missing list to {out_path}")
+            except Exception as e:
+                print(f"Failed to write missing report: {e}", file=sys.stderr)
 
-    # Report missing
-    print("\n=== Missing/Unmatched Tracks ===")
-    if not missing:
-        print("All tracks were matched in Navidrome. Nice!")
-    else:
-        for m in missing:
-            print(f"- {m['artist']} - {m['track']} ({m.get('album','')}) [{m.get('reason','')}]")
-        # Save to file
-        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", playlist_name)[:80]
-        out_path = f"missing_{safe_name}.txt"
-        try:
-            with open(out_path, 'w', encoding='utf-8') as f:
-                f.write(f"Missing tracks for playlist: {playlist_name}\n\n")
-                for m in missing:
-                    f.write(f"- {m['artist']} - {m['track']} ({m.get('album','')}) [{m.get('reason','')}]\n")
-            print(f"\nSaved missing list to {out_path}")
-        except Exception as e:
-            print(f"Failed to write missing report: {e}", file=sys.stderr)
+        # Ask to continue
+        ans = input("\nImport another playlist? [y/N]: ").strip().lower()
+        if ans not in ("y", "yes"):
+            break
 
     return 0
 
