@@ -127,10 +127,15 @@ def spotify_authorize(client_id: str, client_secret: str, redirect_uri: str, sco
         if host in ("localhost", "127.0.0.1") and port not in (80, 443):
             httpd, server_thread = start_local_server(host, port)
             webbrowser.open(url)
+            print("Waiting for authorization...")
             params = wait_for_code(httpd)
+            print("Authorization received, processing...")
             if params.get("state", [None])[0] != state:
                 raise RuntimeError("State mismatch in OAuth response")
             code = params.get("code", [None])[0]
+            print("Shutting down local server...")
+            # Give the HTTP handler time to finish sending the response
+            time.sleep(0.3)
         else:
             # If we can't bind a local server or using 80/443, fall back to manual paste
             webbrowser.open(url)
@@ -143,13 +148,16 @@ def spotify_authorize(client_id: str, client_secret: str, redirect_uri: str, sco
     finally:
         if httpd is not None:
             httpd.shutdown()
+            print("Server shutdown complete.")
         if server_thread is not None:
             server_thread.join(timeout=1)
+            print("Thread cleanup complete.")
 
     if not code:
         raise RuntimeError("Authorization code not found")
 
     # Exchange code for token
+    print("Exchanging authorization code for access token...")
     basic = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
     headers = {"Authorization": f"Basic {basic}", "Content-Type": "application/x-www-form-urlencoded"}
     data = {
@@ -161,6 +169,7 @@ def spotify_authorize(client_id: str, client_secret: str, redirect_uri: str, sco
     if resp.status_code != 200:
         raise RuntimeError(f"Token exchange failed: {resp.status_code} {resp.text}")
     token = resp.json()
+    print("Access token obtained successfully.")
     return token
 
 
